@@ -12,37 +12,108 @@
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
 #include <unordered_map>
+#include <sstream>
+#include <iomanip>
+#include <HDFql.hpp>
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <cv_bridge/cv_bridge.h>
 
 #define foreach BOOST_FOREACH
-
 bool parse_arguments(int argc, char* argv[],
                      std::string* path_to_input_rosbag,
                      std::string* path_to_input_flow,
-                     int* num_frames_skip
+                     int* num_frames_skip,
+                     std::string* events_topic,
+                     std::string* frames_topic
 					 )
 {
-  if(argc < 2)
+  if(argc < 6)
   {
     std::cerr << "Not enough arguments" << std::endl;
-    std::cerr << "Usage: rosrun dvs_rosbag_stats dvs_rosbag_stats path_to_bag.bag";
+    std::cerr << "Usage: rosrun ecnn_eval_flow ecnn_eval_flow path_to_bag.bag";
     return false;
   }
 
   *path_to_input_rosbag = std::string(argv[1]);
+  *path_to_input_flow  = std::string(argv[2]);
+  std::istringstream ss(argv[3]);
+  ss >> *num_frames_skip;
+  *events_topic  = std::string(argv[4]);
+  *frames_topic  = std::string(argv[5]);
+  std::cout << "path to input: " << *path_to_input_rosbag << ", path_to_flow: " << *path_to_input_flow <<
+		  ", num frames to skip: " << *num_frames_skip << std::endl;
 
   return true;
 }
 
-bool compute_stats(const std::string path_to_input_rosbag,
-                   int& num_events,
-                   int& num_frames,
-				   double& num_normed_pos_events, 
-				   double& num_normed_neg_events, 
-                   double& duration)
+std::vector<cv::Mat> load_flow_dir(std::string flow_base_path, int image_idx)
+{
+	std::stringstream ss;
+	ss << "frame_" << std::setw(10) << std::setfill('0') << image_idx << ".yml";
+	std::string s = ss.str();
+	boost::filesystem::path dir(flow_base_path);
+	boost::filesystem::path file(s);
+	boost::filesystem::path flow_path = dir/file;
+	std::cout << flow_path.string() << std::endl;
+	if(boost::filesystem::exists(flow_path))
+	{
+		std::cout << flow_path << " exists!" << std::endl;
+		cv::FileStorage fs(flow_path.string(), cv::FileStorage::READ);
+		cv::Mat flow_x;
+		cv::Mat flow_y;
+		fs["flow_x"] >> flow_x;
+		fs["flow_y"] >> flow_y;
+		std::vector<cv::Mat> ret = {flow_x, flow_y};
+		std::cout << flow_x.size() << std::endl;
+	}
+	std::vector<cv::Mat> ret;
+	return ret;
+}
+
+std::vector<cv::Mat> load_flow_hdf(int image_idx)
+{
+
+	char script[1024];
+	std::stringstream ss;
+	ss << "frame_" << std::setw(9) << std::setfill('0') << image_idx;
+	std::string s = ss.str();
+	sprintf(script, ("SHOW DATASET " + s + "/flow/flow_x").c_str());
+	int success = HDFql::execute(script);
+	if(success == 0)
+	{
+		double hdf_ts = 0;
+		sprintf(script, ("SELECT FROM " + s +"/timestamp INTO MEMORY %d").c_str(),
+				HDFql::variableTransientRegister(&hdf_ts));
+		std::cout << script << ": timestamp = " << hdf_ts << std::endl;
+		long long image_size[2] = {0, 0};
+		sprintf(script, ("SHOW DIMENSION " + s + "/flow/flow_x INTO MEMORY %d")
+				.c_str(), HDFql::variableTransientRegister(&image_size));
+		HDFql::execute(script);
+		cv::Mat flow_x = cv::Mat::zeros(image_size[0], image_size[1], CV_32FC1);
+		cv::Mat flow_y = cv::Mat::zeros(image_size[0], image_size[1], CV_32FC1);
+		sprintf(script, ("SELECT FROM " + s + "/flow/flow_x INTO MEMORY %d").c_str(),
+				HDFql::variableTransientRegister(flow_x.data));
+		int sx = HDFql::execute(script);
+		sprintf(script, ("SELECT FROM " + s + "/flow/flow_y INTO MEMORY %d").c_str(),
+				HDFql::variableTransientRegister(flow_y.data));
+		int sy = HDFql::execute(script);
+		std::cout << s << ": Flow size = " << image_size[0] << "x" << image_size[1] << std::endl;
+		std::cout << "Loading flow: " << sx << ", " << sy << std::endl;
+		std::vector<cv::Mat> flow = {flow_x, flow_y};
+		return flow;
+	}
+	std::vector<cv::Mat> ret;
+	return ret;
+}
+
+bool warp_events(const std::string path_to_input_rosbag,
+		const std::string path_to_input_flow,
+		const int num_frames_skip,
+		const std::string event_topic,
+		const std::string image_topic
+		)
 {
   std::cout << "Processing: " << path_to_input_rosbag << std::endl;
 
@@ -52,6 +123,10 @@ bool compute_stats(const std::string path_to_input_rosbag,
       pos + 1, path_to_input_rosbag.length() - (pos + 1) - 4) + ".txt";
   const std::string path_to_output = output_dir + output_filename;
   boost::filesystem::create_directories(output_dir);
+
+  std::string flow_ext = boost::filesystem::extension(path_to_input_flow);
+  bool flow_h5 = flow_ext.compare(".h5") == 0?true:false;
+  std::cout << "extension = " << flow_ext << ", flow_h5 = " << flow_h5 << std::endl;
 
   rosbag::Bag input_bag;
   try
@@ -71,24 +146,22 @@ bool compute_stats(const std::string path_to_input_rosbag,
   const uint32_t num_messages = view.size();
   uint32_t message_index = 0;
 
-  int num_events_tmp = 0;
-  int num_frames_tmp = 0;
-  double start_time;
-  double end_time = 0;
-  bool first_msg = true;
-
   cv_bridge::CvImagePtr cv_ptr;
   cv::Mat prev_image;
-  double pos_normed_event_sum = 0;
-  int pos_events_since_last_frame = 0;
-  double neg_normed_event_sum = 0;
-  int neg_events_since_last_frame = 0;
-  std::vector<double> pos_normed_events;
-  std::vector<double> neg_normed_events;
-  std::string image_topic = "/cam0/image_raw";
-  std::string event_topic = "/cam0/events";
-//  std::string image_topic = "/dvs/image_raw";
-//  std::string event_topic = "/dvs/events";
+  bool first_msg = true;
+  bool first_frame = true;
+  double start_time = 0;
+  double end_time = 0;
+  int image_idx = 0;
+  char script[1024];
+  std::vector<std::vector<cv::Mat>> flow_arr;
+  std::vector<double> flow_ts;
+
+  if(flow_h5)
+  {
+	  sprintf(script, "USE FILE %s", path_to_input_flow.c_str());
+	  HDFql::execute(script);
+  }
 
   foreach(rosbag::MessageInstance const m, view)
   {
@@ -97,7 +170,7 @@ bool compute_stats(const std::string path_to_input_rosbag,
 
       std::vector<dvs_msgs::Event>& events = event_packets_for_each_event_topic[m.getTopic()];
       dvs_msgs::EventArrayConstPtr s = m.instantiate<dvs_msgs::EventArray>();
-      num_events_tmp += s->events.size();
+      int num_events_tmp = s->events.size();
       if (first_msg)
       {
         start_time = s->events.front().ts.toSec();
@@ -106,51 +179,41 @@ bool compute_stats(const std::string path_to_input_rosbag,
       end_time = std::max(s->events.back().ts.toSec(), end_time);
 
 	  for (auto e : s->events) {
-		if(e.polarity) {pos_events_since_last_frame++;}
-		else{neg_events_since_last_frame++;}
+		  //Warp events
 	  }
 	   
     }
-	else if (m.getDataType() == "sensor_msgs/Image" && m.getTopic()==image_topic) {
+	else if (m.getDataType() == "sensor_msgs/Image" && m.getTopic()==image_topic)
+	{
 		sensor_msgs::ImageConstPtr icp =
 				m.instantiate<sensor_msgs::Image>();
 		double timestamp = icp->header.stamp.toSec();
-		try {
+		if(first_frame)
+		{
+			continue;
+		}
+		try
+		{
 			cv_ptr = cv_bridge::toCvCopy(icp,
 					sensor_msgs::image_encodings::TYPE_8UC1);
-		} catch (cv_bridge::Exception& e) {
+		} catch (cv_bridge::Exception& e)
+		{
 			return false;
 		}
-		if(num_frames_tmp > 0)
+		if(flow_h5)
 		{
-			cv::Mat diff_img;
-			cv::subtract(cv_ptr->image, prev_image, diff_img, cv::noArray(), CV_32FC1);
-			cv::Mat pos_img;
-			cv::Mat neg_img;
-			cv::threshold(diff_img, pos_img, 0, 255, cv::THRESH_TOZERO);	
-			cv::threshold(diff_img, neg_img, 0, 255, cv::THRESH_TOZERO_INV);	
-			double pos_sum = cv::sum(pos_img)[0];
-			double neg_sum = -cv::sum(neg_img)[0];
-//			std::cout << "pos: " << pos_events_since_last_frame << "/" << pos_sum
-//				<< ", neg: " << neg_events_since_last_frame << "/" << neg_sum << ", sum: " << cv::sum(diff_img)[0] << "\n";
-			pos_normed_events.push_back(pos_events_since_last_frame/pos_sum);
-			neg_normed_events.push_back(neg_events_since_last_frame/neg_sum);
-//			std::cout << "pos: " << pos_normed_events.back() << ", neg: " << neg_normed_events.back() << "\n";
-			pos_events_since_last_frame = 0; 
-			neg_events_since_last_frame = 0; 
+			std::vector<cv::Mat> flow = load_flow_hdf(image_idx);
+			std::cout << flow.size() << std::endl;
+		} else
+		{
+			std::vector<cv::Mat> flow = load_flow_dir(path_to_input_flow, image_idx);
+			std::cout << flow.size() << std::endl;
 		}
-		prev_image = cv_ptr->image;
-		num_frames_tmp += 1;
+		image_idx ++;
 	}
   }
 
   input_bag.close();
-
-  num_events = num_events_tmp;
-  num_normed_pos_events = accumulate(pos_normed_events.begin(), pos_normed_events.end(), 0.0)/pos_normed_events.size();
-  num_normed_neg_events = accumulate(neg_normed_events.begin(), neg_normed_events.end(), 0.0)/neg_normed_events.size();
-  num_frames = num_frames_tmp;
-  duration = end_time - start_time;
 
   return true;
 }
@@ -184,41 +247,37 @@ bool hasEnding (std::string const &fullString, std::string const &ending) {
 int main(int argc, char* argv[])
 {
   std::string path_to_input_rosbag;
-  int max_num_events_per_packet;
-  ros::Duration max_duration_event_packet;
+  std::string path_to_input_flow;
+  std::string events_topic;
+  std::string frames_topic;
+  int num_frames_skip;
 
-  if (!parse_arguments(argc, argv, &path_to_input_rosbag))
+  if (!parse_arguments(argc, argv, &path_to_input_rosbag, &path_to_input_flow,
+		  &num_frames_skip, &events_topic, &frames_topic))
   {
     return -1;
   }
 
-  double num_normed_pos_events; 
-  double num_normed_neg_events; 
-  int num_events;
-  int num_frames;
-  double duration;
-
-  if (!compute_stats(path_to_input_rosbag,
-                    num_events,
-                    num_frames,
-					num_normed_pos_events,
-					num_normed_neg_events,
-                    duration))
+  if (!warp_events(path_to_input_rosbag,
+		  path_to_input_flow,
+		  num_frames_skip,
+		  events_topic,
+		  frames_topic))
   {
-    return -1;
+	  return -1;
   }
 
-  auto const pos = path_to_input_rosbag.find_last_of('/');
-  const std::string output_dir = path_to_input_rosbag.substr(0, pos + 1) + "stats/";
-  const std::string output_filename = path_to_input_rosbag.substr(
-      pos + 1, path_to_input_rosbag.length() - (pos + 1) - 4) + ".txt";
-  const std::string path_to_output = output_dir + output_filename;
-  boost::filesystem::create_directories(output_dir);
-  write_stats(path_to_output,
-              num_events,
-              num_frames,
-			  num_normed_pos_events,
-			  num_normed_neg_events,
-              duration);
+//  auto const pos = path_to_input_rosbag.find_last_of('/');
+//  const std::string output_dir = path_to_input_rosbag.substr(0, pos + 1) + "stats/";
+//  const std::string output_filename = path_to_input_rosbag.substr(
+//      pos + 1, path_to_input_rosbag.length() - (pos + 1) - 4) + ".txt";
+//  const std::string path_to_output = output_dir + output_filename;
+//  boost::filesystem::create_directories(output_dir);
+//  write_stats(path_to_output,
+//              num_events,
+//              num_frames,
+//			  num_normed_pos_events,
+//			  num_normed_neg_events,
+//              duration);
   return 0;
 }
