@@ -21,6 +21,8 @@
 #include <cv_bridge/cv_bridge.h>
 
 #define foreach BOOST_FOREACH
+
+
 bool parse_arguments(int argc, char* argv[],
                      std::string* path_to_input_rosbag,
                      std::string* path_to_input_flow,
@@ -47,6 +49,15 @@ bool parse_arguments(int argc, char* argv[],
 
   return true;
 }
+
+struct Event {
+	int x;
+	int y;
+	double t;
+	signed char s;
+	Event(int x, int y, double t, signed char s) :
+		x(x), y(y), t(t), s(s) {}
+};
 
 std::vector<cv::Mat> load_flow_dir(std::string flow_base_path, int image_idx)
 {
@@ -156,6 +167,7 @@ bool warp_events(const std::string path_to_input_rosbag,
   char script[1024];
   std::vector<std::vector<cv::Mat>> flow_arr;
   std::vector<double> flow_ts;
+  std::vector<Event> event_arr;
 
   if(flow_h5)
   {
@@ -179,6 +191,8 @@ bool warp_events(const std::string path_to_input_rosbag,
       end_time = std::max(s->events.back().ts.toSec(), end_time);
 
 	  for (auto e : s->events) {
+		  Event event(e.x, e.y, e.ts.toSec(), e.polarity?1:-1);
+		  event_arr.push_back(event);
 		  //Warp events
 	  }
 	   
@@ -203,10 +217,14 @@ bool warp_events(const std::string path_to_input_rosbag,
 		if(flow_h5)
 		{
 			std::vector<cv::Mat> flow = load_flow_hdf(image_idx);
+			flow_arr.push_back(flow);
+			flow_ts.push_back(timestamp);
 			std::cout << flow.size() << std::endl;
 		} else
 		{
 			std::vector<cv::Mat> flow = load_flow_dir(path_to_input_flow, image_idx);
+			flow_arr.push_back(flow);
+			flow_ts.push_back(timestamp);
 			std::cout << flow.size() << std::endl;
 		}
 		image_idx ++;
