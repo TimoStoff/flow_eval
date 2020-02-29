@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>ecnn_eval_flow</name>
+  <version>0.0.0</version>
+  <description>Evaluate the quality of flow by computing variance of warped events</description>
+  <maintainer email="timo.stoffregen@outlook.com">Timo Stoffregen</maintainer>
+  <license>GNU GPL</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend>catkin_simple</buildtool_depend>
+
+  <depend>gflags_catkin</depend>
+  <depend>roscpp</depend>
+  <depend>rosbag</depend>
+  <depend>dvs_msgs</depend>
+  <depend>cv_bridge</depend>
+
+</package>
