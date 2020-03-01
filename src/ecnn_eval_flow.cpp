@@ -60,9 +60,10 @@ struct Event {
 	double x;
 	double y;
 	double t;
+	double t_original;
 	int s;
 	Event(int x, int y, double t, signed char s) :
-		x(x), y(y), t(t), s(s) {}
+		x(x), y(y), t(t), s(s), t_original(t) {}
 };
 
 int centercrop(cv::Mat & in, cv::Size & new_size)
@@ -200,58 +201,29 @@ int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 	return last_event_idx;
 }
 
-double get_mitrokhin_loss(std::vector<Flow> & flow_arr,
-		std::vector<double> & flow_ts,
-		std::vector<Event>& events,
-		cv::Size & imgsz,
-		int skip_frames,
-		const cv::Rect & crop_roi)
+void save_image(const cv::Mat & img, const std::string & output_path)
 {
-	cv::Mat pos_img(imgsz, CV_32FC1);
-	cv::Mat pos_sum(imgsz, CV_32FC1);
-	cv::Mat neg_img(imgsz, CV_32FC1);
-	cv::Mat neg_sum(imgsz, CV_32FC1);
-	bool no_warp = false;
-	int final_flow_idx = skip_frames-1;
-	const double first_ts = flow_ts.front();
-	if(flow_ts.size() < skip_frames )
-	{
-		return -1;
-	}
-	if(events.back().t < flow_ts.at(final_flow_idx))
-	{
-		return -1;
-	}
-	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
-	double end_ts = flow_ts.at(final_flow_idx);
-	int last_event_idx = 0;
-	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
-	{
-		last_event_idx = 0;
-		std::cout << "Frame " << flow_idx << std::endl;
-		for(Event & e: events)
-		{
-			const Flow & flow = flow_arr.at(flow_idx);
-			double t_ref = flow_ts.at(flow_idx);
-			if(e.t >= end_ts || e.t >= t_ref) {break;}
-			if(!no_warp)
-			{
-				double dt = t_ref - e.t;
-				const int ex = int(e.x);
-				const int ey = int(e.y);
-				const cv::Size & flow_sz = flow.at(0).size();
-				if(ex<0 || ex>flow_sz.width || ey<0 || ey>flow_sz.height) {continue;}
-				double flowx = flow.at(0).at<float>(ey, ex);
-				double flowy = flow.at(1).at<float>(ey, ex);
-				e.x = e.x+flowx*dt;
-				e.y = e.y+flowy*dt;
-				e.t = t_ref;
-			}
-			last_event_idx++;
-		}
-	}
-			std::cout << "m1 " << last_event_idx << std::endl;
-	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
+	cv::Mat normed;
+	cv::normalize(img, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+	cv::imwrite(output_path, normed);
+}
+
+double get_mitrokhin_loss(
+		std::vector<Event>& events,
+		int e_start_idx,
+		int e_end_idx,
+		cv::Size & imgsz,
+		const cv::Rect & crop_roi,
+		bool save_images,
+		const std::string & save_images_path)
+{
+	cv::Mat pos_img = cv::Mat::zeros(imgsz, CV_32FC1);
+	cv::Mat pos_sum = cv::Mat::zeros(imgsz, CV_32FC1);
+	cv::Mat neg_img = cv::Mat::zeros(imgsz, CV_32FC1);
+	cv::Mat neg_sum = cv::Mat::zeros(imgsz, CV_32FC1);
+
+	const double first_ts = events.at(e_start_idx).t_original;
+	for(int e_idx=e_start_idx; e_idx<e_end_idx; e_idx++)
 	{
 		Event & e = events.at(e_idx);
 		const int px = int(e.x);
@@ -261,20 +233,17 @@ double get_mitrokhin_loss(std::vector<Flow> & flow_arr,
 		if(px<0 || px>=imgsz.width-1 || py<0 || py>=imgsz.height-1) {
 			continue;
 		}
-		double ts = e.t-first_ts;
+		double ts = e.t_original-first_ts;
 		if(e.s>0)
 		{
-			std::cout << ts << std::endl;
-			pos_img.at<float>(py, px) += ts;
-			pos_sum.at<float>(py, px) += 1.0;
-//			pos_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
-//			pos_img.at<float>(cv::Point(px + 1, py)) += ts * dx * (1.0 - dy);
-//			pos_img.at<float>(cv::Point(px, py + 1)) += ts * dy * (1.0 - dx);
-//			pos_img.at<float>(cv::Point(px + 1, py + 1)) += ts * dx * dy;
-//			pos_sum.at<float>(cv::Point(px, py)) +=  (1.0 - dx) * (1.0 - dy);
-//			pos_sum.at<float>(cv::Point(px + 1, py)) +=  dx * (1.0 - dy);
-//			pos_sum.at<float>(cv::Point(px, py + 1)) +=  dy * (1.0 - dx);
-//			pos_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
+			pos_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
+			pos_img.at<float>(cv::Point(px + 1, py)) += ts * dx * (1.0 - dy);
+			pos_img.at<float>(cv::Point(px, py + 1)) += ts * dy * (1.0 - dx);
+			pos_img.at<float>(cv::Point(px + 1, py + 1)) += ts * dx * dy;
+			pos_sum.at<float>(cv::Point(px, py)) +=  (1.0 - dx) * (1.0 - dy);
+			pos_sum.at<float>(cv::Point(px + 1, py)) +=  dx * (1.0 - dy);
+			pos_sum.at<float>(cv::Point(px, py + 1)) +=  dy * (1.0 - dx);
+			pos_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
 		} else
 		{
 			neg_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
@@ -287,71 +256,29 @@ double get_mitrokhin_loss(std::vector<Flow> & flow_arr,
 			neg_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
 		}
 	}
-	cv::Mat normed;
-	cv::normalize(pos_img, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-	cv::imshow("pos", normed);
-	cv::waitKey();
 	pos_img = pos_img.mul(1.0/pos_sum);
 	neg_img = neg_img.mul(1.0/neg_sum);
-	cv::normalize(pos_img, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-	cv::imshow("pos", normed);
-	cv::waitKey();
 	cv::Mat pos_prod = pos_img.mul(pos_img);
 	cv::Mat neg_prod = neg_img.mul(neg_img);
 	pos_prod = pos_prod(crop_roi).clone();
 	neg_prod = neg_prod(crop_roi).clone();
 	cv::Scalar loss = cv::sum(pos_prod) + cv::sum(neg_prod);
-	std::cout << "Mitrokhin = " << loss << std::endl;
+	if(save_images) {save_image(pos_prod, save_images_path);}
 	return loss[0];
 }
-int warp_events_to_image(std::vector<Flow> & flow_arr,
-		std::vector<double> & flow_ts,
+
+
+double get_warp_loss(
 		std::vector<Event>& events,
-		cv::Mat & iwe,
-		int skip_frames)
+		int e_start_idx,
+		int e_end_idx,
+		cv::Size & imgsz,
+		const cv::Rect & crop_roi,
+		bool save_images,
+		const std::string & save_images_path)
 {
-	bool no_warp = false;
-	int final_flow_idx = skip_frames-1;
-	if(flow_ts.size() < skip_frames )
-	{
-//		std::cout << "Insufficient frames:" << flow_ts.size() << "<" << skip_frames << std::endl;
-		return -1;
-	}
-	if(events.back().t < flow_ts.at(final_flow_idx))
-	{
-//		std::cout << "Insufficient events:" << flow_ts.size() << "<" << skip_frames
-//				<< ", " << events.back().t << "<" << flow_ts.at(final_flow_idx)<< std::endl;
-		return -1;
-	}
-	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
-	double end_ts = flow_ts.at(final_flow_idx);
-	int last_event_idx = 0;
-	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
-	{
-		last_event_idx = 0;
-		std::cout << "Frame " << flow_idx << std::endl;
-		for(Event & e: events)
-		{
-			const Flow & flow = flow_arr.at(flow_idx);
-			double t_ref = flow_ts.at(flow_idx);
-			if(e.t >= end_ts || e.t >= t_ref) {break;}
-			if(!no_warp)
-			{
-				double dt = t_ref - e.t;
-				const int ex = int(e.x);
-				const int ey = int(e.y);
-				const cv::Size & flow_sz = flow.at(0).size();
-				if(ex<0 || ex>flow_sz.width || ey<0 || ey>flow_sz.height) {continue;}
-				double flowx = flow.at(0).at<float>(ey, ex);
-				double flowy = flow.at(1).at<float>(ey, ex);
-				e.x = e.x+flowx*dt;
-				e.y = e.y+flowy*dt;
-				e.t = t_ref;
-			}
-			last_event_idx++;
-		}
-	}
-	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
+	cv::Mat iwe = cv::Mat::zeros(imgsz, CV_32FC1);
+	for(int e_idx=e_start_idx; e_idx<e_end_idx; e_idx++)
 	{
 		Event & e = events.at(e_idx);
 		const int px = int(e.x);
@@ -365,6 +292,59 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		iwe.at<float>(cv::Point(px + 1, py)) += e.s * dx * (1.0 - dy);
 		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
 		iwe.at<float>(cv::Point(px + 1, py + 1)) += e.s * dx * dy;
+	}
+	iwe = iwe(crop_roi).clone();
+	cv::Scalar mean, stdev;
+	cv::meanStdDev(iwe, mean, stdev);
+	iwe -= mean[0];
+	cv::meanStdDev(iwe, mean, stdev);
+	double var = stdev[0]*stdev[0];
+	if(save_images) {save_image(iwe, save_images_path);}
+	return var;
+}
+
+int warp_events(std::vector<Flow> & flow_arr,
+		std::vector<double> & flow_ts,
+		std::vector<Event>& events,
+		int skip_frames)
+{
+	bool no_warp = false;
+	int final_flow_idx = skip_frames-1;
+	if(flow_ts.size() < skip_frames )
+	{
+		return -1;
+	}
+	if(events.back().t < flow_ts.at(final_flow_idx))
+	{
+		return -1;
+	}
+	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
+	double end_ts = flow_ts.at(final_flow_idx);
+	int last_event_idx = 0;
+	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
+	{
+		last_event_idx = 0;
+		std::cout << "Frame " << flow_idx << std::endl;
+		for(Event & e: events)
+		{
+			const Flow & flow = flow_arr.at(flow_idx);
+			double t_ref = flow_ts.at(flow_idx);
+			if(e.t >= end_ts || e.t >= t_ref) {break;}
+			if(!no_warp)
+			{
+				double dt = t_ref - e.t;
+				const int ex = int(e.x);
+				const int ey = int(e.y);
+				const cv::Size & flow_sz = flow.at(0).size();
+				if(ex<0 || ex>flow_sz.width || ey<0 || ey>flow_sz.height) {continue;}
+				double flowx = flow.at(0).at<float>(ey, ex);
+				double flowy = flow.at(1).at<float>(ey, ex);
+				e.x = e.x+flowx*dt;
+				e.y = e.y+flowy*dt;
+				e.t = t_ref;
+			}
+			last_event_idx++;
+		}
 	}
 	return last_event_idx;
 }
@@ -517,42 +497,27 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
 				(frame_size.height-evfn_crop)/2, 160, 160):
 				cv::Rect(w_offset, h_offset, flow_size.width, flow_size.height);
 		std::cout << "ROI = " << roi << std::endl;
-		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
-		std::cout << "Warping used " << last_event_idx << " events" << std::endl;
-		double ml = get_mitrokhin_loss(flow_arr, flow_ts, event_arr, flow_size, num_frames_skip, roi);
-		mitrokhin.push_back(ml);
+
+
+		int last_event_idx = warp_events(flow_arr, flow_ts, event_arr, num_frames_skip);
 
 		if(last_event_idx > -1)
 		{
-			//Need to do this, since EVFlowNet has 160x160 crops
-			//for fair comparison
-			iwe = iwe(roi).clone();
-			cv::Scalar mean, stdev;
-			cv::meanStdDev(iwe, mean, stdev);
-			iwe -= mean[0];
-			cv::meanStdDev(iwe, mean, stdev);
-			double var = stdev[0]*stdev[0];
-
-			if(reverse_warp)
-			{
-				iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
-				warp_events_to_image_reverse(flow_arr, flow_ts, event_arr, iwe,
-						num_frames_skip, last_event_idx);
-				iwe = iwe(roi).clone();
-				cv::meanStdDev(iwe, mean, stdev);
-				iwe -= mean[0];
-				cv::meanStdDev(iwe, mean, stdev);
-				var += stdev[0]*stdev[0];
-			}
-
 			std::stringstream ss;
 			ss << outputs_path << "/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
 			std::string s = ss.str();
-			cv::Mat normed;
-			cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-			cv::imwrite(s, normed);
+
+			double var = get_warp_loss(event_arr, 0, last_event_idx, flow_size, roi, true, s);
+			double ml = get_mitrokhin_loss(event_arr, 0, last_event_idx, flow_size, roi, false, s);
+
+			if(reverse_warp)
+			{
+				warp_events_to_image_reverse(flow_arr, flow_ts, event_arr, iwe,
+						num_frames_skip, last_event_idx);
+			}
 
 			variances.push_back(var);
+			mitrokhin.push_back(ml);
 			event_arr.erase(event_arr.begin(), event_arr.begin()+last_event_idx);
 			flow_arr.erase(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
 			flow_ts.erase(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
