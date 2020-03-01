@@ -134,6 +134,7 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		cv::Mat & iwe,
 		int skip_frames)
 {
+	bool no_warp = false;
 	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
 	int final_flow_idx = skip_frames-1;
 	if(flow_ts.size() < skip_frames )
@@ -151,25 +152,30 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 	int last_event_idx = 0;
 	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
 	{
+		last_event_idx = 0;
 		//std::cout << "Frame " << flow_idx << std::endl;
 		for(Event & e: events)
 		{
 			const Flow & flow = flow_arr.at(flow_idx);
 			double t_ref = flow_ts.at(flow_idx);
 			if(e.t >= end_ts || e.t >= t_ref) {break;}
-			double dt = t_ref - e.t;
-			const int ex = int(e.x);
-			const int ey = int(e.y);
-			const cv::Size & flow_sz = flow.at(0).size();
-			if(e.x<0 || e.x>flow_sz.width || e.y<0 || e.y>flow_sz.height) {continue;}
-			double flowx = flow.at(0).at<float>(int(e.y), int(e.x));
-			double flowy = flow.at(1).at<float>(int(e.y), int(e.x));
-//			std::cout << e.x << "->" << flowx << "*" << dt << "+" << e.x<<"="<<(flowx*dt+1.0*e.x)<< std::endl;
-			e.x = flowx*dt+e.x;
-			e.y = flowy*dt+e.y;
+			if(!no_warp)
+			{
+				double dt = t_ref - e.t;
+				const int ex = int(e.x);
+				const int ey = int(e.y);
+				const cv::Size & flow_sz = flow.at(0).size();
+				if(e.x<0 || e.x>flow_sz.width || e.y<0 || e.y>flow_sz.height) {continue;}
+				double flowx = flow.at(0).at<float>(int(e.y), int(e.x));
+				double flowy = flow.at(1).at<float>(int(e.y), int(e.x));
+				e.x = e.x+flowx*dt;
+				e.y = e.y+flowy*dt;
+				e.t = t_ref;
+			}
 			last_event_idx++;
 		}
 	}
+	//std::cout << "m1" <<  std::endl;
 	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
 	{
 		Event & e = events.at(e_idx);
@@ -180,7 +186,7 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		if(px<0 || px>=iwe.size().width-1 || py<0 || py>=iwe.size().height-1) {
 			continue;
 		}
-//		std::cout << "add at " << px << ", " << py << std::endl;
+		//std::cout << "add at " << px << ", " << py << std::endl;
 		iwe.at<float>(cv::Point(px, py)) += e.s * (1.0 - dx) * (1.0 - dy);
 		iwe.at<float>(cv::Point(px + 1, py)) += e.s * dx * (1.0 - dy);
 		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
@@ -317,16 +323,16 @@ bool warp_events(const std::string path_to_input_rosbag,
 		cv::Mat iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
 		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
 
-		std::stringstream ss;
-		ss << "/tmp/warps/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
-		std::string s = ss.str();
-		cv::Mat normed;
-		cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-		cv::imwrite(s, normed);
 		std::cout << "sum = " << cv::sum(iwe)[0] << std::endl;
 
 		if(last_event_idx > -1)
 		{
+			std::stringstream ss;
+			ss << "/tmp/warps/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
+			std::string s = ss.str();
+			cv::Mat normed;
+			cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+			cv::imwrite(s, normed);
 			event_arr.erase(event_arr.begin(), event_arr.begin()+last_event_idx-1);
 			flow_arr.erase(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
 			flow_ts.erase(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
