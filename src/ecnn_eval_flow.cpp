@@ -29,13 +29,15 @@ bool parse_arguments(int argc, char* argv[],
                      std::string* path_to_input_flow,
                      int* num_frames_skip,
                      std::string* events_topic,
-                     std::string* frames_topic
+                     std::string* frames_topic,
+                     std::string* output_path,
+					 int* ours
 					 )
 {
-  if(argc < 6)
+  if(argc < 8)
   {
-    std::cerr << "Not enough arguments" << std::endl;
-    std::cerr << "Usage: rosrun ecnn_eval_flow ecnn_eval_flow path_to_bag.bag";
+    std::cerr << argc << ": Not enough arguments" << std::endl;
+    std::cerr << "Usage: rosrun ecnn_eval_flow ecnn_eval_flow path_to_bag.bag" << std::endl;
     return false;
   }
 
@@ -45,6 +47,9 @@ bool parse_arguments(int argc, char* argv[],
   ss >> *num_frames_skip;
   *events_topic  = std::string(argv[4]);
   *frames_topic  = std::string(argv[5]);
+  *output_path  = std::string(argv[6]);
+  std::istringstream ss1(argv[7]);
+  ss1 >> *ours;
   std::cout << "path to input: " << *path_to_input_rosbag << ", path_to_flow: " << *path_to_input_flow <<
 		  ", num frames to skip: " << *num_frames_skip << std::endl;
 
@@ -142,11 +147,12 @@ int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 	int last_event_idx = 0;
 	std::vector<double> timestamps;
 	{
-	for(int flow_idx = 1; flow_idx <= final_flow_idx; flow_idx++)
+	for(int flow_idx = final_flow_idx-1; flow_idx >= 0; flow_idx--)
 		timestamps.push_back(flow_ts.at(flow_idx));
 	}
-	std::cout << "Reverse warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
 	timestamps.push_back(events.front().t);
+	for(auto&t:timestamps){std::cout << t << ", "; }std::cout << std::endl;
+	std::cout << "Reverse warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
 	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
 	{
 		last_event_idx = 0;
@@ -166,9 +172,9 @@ int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 				const int ex = int(e.x);
 				const int ey = int(e.y);
 				const cv::Size & flow_sz = flow.at(0).size();
-				if(e.x<0 || e.x>flow_sz.width || e.y<0 || e.y>flow_sz.height) {continue;}
-				double flowx = flow.at(0).at<float>(int(e.y), int(e.x));
-				double flowy = flow.at(1).at<float>(int(e.y), int(e.x));
+				if(ex<0 || ex>flow_sz.width || ey<0 || ey>flow_sz.height) {continue;}
+				double flowx = flow.at(0).at<float>(ey,ex);
+				double flowy = flow.at(1).at<float>(ey,ex);
 				e.x = e.x-flowx*dt;
 				e.y = e.y-flowy*dt;
 				e.t = t_ref;
@@ -191,6 +197,97 @@ int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
 		iwe.at<float>(cv::Point(px + 1, py + 1)) += e.s * dx * dy;
 	}
+	return last_event_idx;
+}
+
+int warp_events_to_avg_ts_image(std::vector<Flow> & flow_arr,
+		std::vector<double> & flow_ts,
+		std::vector<Event>& events,
+		cv::Size & imgsz,
+		int skip_frames,
+		cv::Scalar & loss)
+{
+	cv::Mat pos_img(imgsz, CV_32FC1);
+	cv::Mat pos_sum(imgsz, CV_32FC1);
+	cv::Mat neg_img(imgsz, CV_32FC1);
+	cv::Mat neg_sum(imgsz, CV_32FC1);
+	bool no_warp = false;
+	int final_flow_idx = skip_frames-1;
+	const double first_ts = flow_ts.front();
+	if(flow_ts.size() < skip_frames )
+	{
+		return -1;
+	}
+	if(events.back().t < flow_ts.at(final_flow_idx))
+	{
+		return -1;
+	}
+	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
+	double end_ts = flow_ts.at(final_flow_idx);
+	int last_event_idx = 0;
+	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
+	{
+		last_event_idx = 0;
+		std::cout << "Frame " << flow_idx << std::endl;
+		for(Event & e: events)
+		{
+			const Flow & flow = flow_arr.at(flow_idx);
+			double t_ref = flow_ts.at(flow_idx);
+			if(e.t >= end_ts || e.t >= t_ref) {break;}
+			if(!no_warp)
+			{
+				double dt = t_ref - e.t;
+				const int ex = int(e.x);
+				const int ey = int(e.y);
+				const cv::Size & flow_sz = flow.at(0).size();
+				if(ex<0 || ex>flow_sz.width || ey<0 || ey>flow_sz.height) {continue;}
+				double flowx = flow.at(0).at<float>(ey, ex);
+				double flowy = flow.at(1).at<float>(ey, ex);
+				e.x = e.x+flowx*dt;
+				e.y = e.y+flowy*dt;
+				e.t = t_ref;
+			}
+			last_event_idx++;
+		}
+	}
+	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
+	{
+		Event & e = events.at(e_idx);
+		const int px = int(e.x);
+		const int py = int(e.y);
+		const double dx = e.x-px;
+		const double dy = e.y-py;
+		if(px<0 || px>=imgsz.width-1 || py<0 || py>=imgsz.height-1) {
+			continue;
+		}
+		double ts = e.t-first_ts;
+		if(e.s>0)
+		{
+			pos_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
+			pos_img.at<float>(cv::Point(px + 1, py)) += ts * dx * (1.0 - dy);
+			pos_img.at<float>(cv::Point(px, py + 1)) += ts * dy * (1.0 - dx);
+			pos_img.at<float>(cv::Point(px + 1, py + 1)) += ts * dx * dy;
+			pos_sum.at<float>(cv::Point(px, py)) +=  (1.0 - dx) * (1.0 - dy);
+			pos_sum.at<float>(cv::Point(px + 1, py)) +=  dx * (1.0 - dy);
+			pos_sum.at<float>(cv::Point(px, py + 1)) +=  dy * (1.0 - dx);
+			pos_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
+		} else
+		{
+			neg_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
+			neg_img.at<float>(cv::Point(px + 1, py)) += ts * dx * (1.0 - dy);
+			neg_img.at<float>(cv::Point(px, py + 1)) += ts * dy * (1.0 - dx);
+			neg_img.at<float>(cv::Point(px + 1, py + 1)) += ts * dx * dy;
+			neg_sum.at<float>(cv::Point(px, py)) +=  (1.0 - dx) * (1.0 - dy);
+			neg_sum.at<float>(cv::Point(px + 1, py)) +=  dx * (1.0 - dy);
+			neg_sum.at<float>(cv::Point(px, py + 1)) +=  dy * (1.0 - dx);
+			neg_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
+		}
+	}
+	pos_img = pos_img.mul(1.0/pos_sum);
+	neg_img = neg_img.mul(1.0/neg_sum);
+	cv::Mat pos_prod = pos_img.mul(pos_img);
+	cv::Mat neg_prod = neg_img.mul(neg_img);
+	loss = cv::sum(pos_prod) + cv::sum(neg_prod);
 	return last_event_idx;
 }
 int warp_events_to_image(std::vector<Flow> & flow_arr,
@@ -218,7 +315,7 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
 	{
 		last_event_idx = 0;
-		//std::cout << "Frame " << flow_idx << std::endl;
+		std::cout << "Frame " << flow_idx << std::endl;
 		for(Event & e: events)
 		{
 			const Flow & flow = flow_arr.at(flow_idx);
@@ -230,9 +327,9 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 				const int ex = int(e.x);
 				const int ey = int(e.y);
 				const cv::Size & flow_sz = flow.at(0).size();
-				if(e.x<0 || e.x>flow_sz.width || e.y<0 || e.y>flow_sz.height) {continue;}
-				double flowx = flow.at(0).at<float>(int(e.y), int(e.x));
-				double flowy = flow.at(1).at<float>(int(e.y), int(e.x));
+				if(ex<0 || ex>flow_sz.width || ey<0 || ey>flow_sz.height) {continue;}
+				double flowx = flow.at(0).at<float>(ey, ex);
+				double flowy = flow.at(1).at<float>(ey, ex);
 				e.x = e.x+flowx*dt;
 				e.y = e.y+flowy*dt;
 				e.t = t_ref;
@@ -258,14 +355,16 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 	return last_event_idx;
 }
 
-bool warp_events(const std::string path_to_input_rosbag,
+std::vector<double> warp_events(const std::string path_to_input_rosbag,
 		const std::string path_to_input_flow,
 		const int num_frames_skip,
 		const std::string event_topic,
-		const std::string image_topic
+		const std::string image_topic,
+		const bool & our_flow
 		)
 {
   std::cout << "Processing: " << path_to_input_rosbag << std::endl;
+  std::vector<double> variances;
 
   auto const pos = path_to_input_rosbag.find_last_of('/');
   const std::string output_dir = path_to_input_rosbag.substr(0, pos + 1) + "stats/";
@@ -286,7 +385,7 @@ bool warp_events(const std::string path_to_input_rosbag,
   catch(rosbag::BagIOException e)
   {
     std::cerr << "Error: could not open rosbag: " << path_to_input_rosbag << std::endl;
-    return false;
+    return variances;
   }
 
   rosbag::View view(input_bag);
@@ -299,6 +398,7 @@ bool warp_events(const std::string path_to_input_rosbag,
   cv_bridge::CvImagePtr cv_ptr;
   cv::Mat prev_image;
   double prev_image_ts;
+  bool reverse_warp = false;
   bool first_msg = true;
   bool first_frame = true;
   bool has_offset = false;
@@ -311,7 +411,6 @@ bool warp_events(const std::string path_to_input_rosbag,
   std::vector<Flow> flow_arr;
   std::vector<double> flow_ts;
   std::vector<Event> event_arr;
-  std::vector<double> variances;
 
   if(flow_h5)
   {
@@ -355,7 +454,7 @@ bool warp_events(const std::string path_to_input_rosbag,
 					sensor_msgs::image_encodings::TYPE_8UC1);
 		} catch (cv_bridge::Exception& e)
 		{
-			return false;
+			return variances;
 		}
 		if(flow_h5)
 		{
@@ -373,6 +472,11 @@ bool warp_events(const std::string path_to_input_rosbag,
 			flow_arr.push_back(flow);
 			flow_ts.push_back(timestamp);
 		}
+		if(flow_arr.back().size() == 0)
+		{
+			input_bag.close();
+			return variances;
+		}
 		if(!has_offset)
 		{
 			w_offset = (cv_ptr->image.cols-flow_arr.at(0).at(0).cols)/2;
@@ -385,27 +489,40 @@ bool warp_events(const std::string path_to_input_rosbag,
 			has_offset = true;
 			std::cout << "OFFSET = " << w_offset << ", " << h_offset << std::endl;
 		}
-		image_idx ++;
+		std::cout << "Image " << image_idx << std::endl;
 		cv::Mat iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
 		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
 
 		if(last_event_idx > -1)
 		{
-
+			//Need to do this, since EVFlowNet has 160x160 crops
+			//for fair comparison
+			if(our_flow)
+			{
+				const cv::Rect roi(40, 10, 160, 160);
+				iwe = iwe(roi).clone();
+			}
 			cv::Scalar mean, stdev;
 			cv::meanStdDev(iwe, mean, stdev);
 			iwe -= mean[0];
 			cv::meanStdDev(iwe, mean, stdev);
 			double var = stdev[0]*stdev[0];
 
-			iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
-			warp_events_to_image_reverse(flow_arr, flow_ts, event_arr, iwe,
-					num_frames_skip, last_event_idx);
-			cv::meanStdDev(iwe, mean, stdev);
-			iwe -= mean[0];
-			cv::meanStdDev(iwe, mean, stdev);
-			double var_backward = stdev[0]*stdev[0];
-			std::cout << "var = " << var << ", backvar = " << var_backward << std::endl;
+			if(reverse_warp)
+			{
+				iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
+				warp_events_to_image_reverse(flow_arr, flow_ts, event_arr, iwe,
+						num_frames_skip, last_event_idx);
+				if(our_flow)
+				{
+					const cv::Rect roi(40, 10, 160, 160);
+					iwe = iwe(roi).clone();
+				}
+				cv::meanStdDev(iwe, mean, stdev);
+				iwe -= mean[0];
+				cv::meanStdDev(iwe, mean, stdev);
+				var += stdev[0]*stdev[0];
+			}
 
 			std::stringstream ss;
 			ss << "/tmp/warps/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
@@ -419,13 +536,14 @@ bool warp_events(const std::string path_to_input_rosbag,
 			flow_arr.erase(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
 			flow_ts.erase(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
 		}
+		image_idx ++;
 		prev_image_ts = timestamp;
 	}
   }
 
   input_bag.close();
 
-  return true;
+  return variances;
 }
 
 bool write_stats(const std::string path_to_output,
@@ -460,22 +578,43 @@ int main(int argc, char* argv[])
   std::string path_to_input_flow;
   std::string events_topic;
   std::string frames_topic;
+  std::string output_path;
   int num_frames_skip;
+  int ours;
 
   if (!parse_arguments(argc, argv, &path_to_input_rosbag, &path_to_input_flow,
-		  &num_frames_skip, &events_topic, &frames_topic))
+		  &num_frames_skip, &events_topic, &frames_topic, &output_path, &ours))
   {
     return -1;
   }
+  bool our_flow = ours==1?true:false;
+  boost::filesystem::create_directories(output_path);
+  boost::filesystem::path outpath(output_path);
+  boost::filesystem::path outfile(path_to_input_rosbag);
+  boost::filesystem::path rootdir = outfile.stem();
+  boost::filesystem::path file_path = output_path/rootdir;
 
-  if (!warp_events(path_to_input_rosbag,
+  std::vector<double> variances = warp_events(path_to_input_rosbag,
 		  path_to_input_flow,
 		  num_frames_skip,
 		  events_topic,
-		  frames_topic))
+		  frames_topic,
+		  our_flow);
+
+  std::string variance_file_name = file_path.string()+".txt";
+  std::cout << "Saving results to " << variance_file_name << std::endl;
+  std::ofstream myfile;
+  double total_var = 0;
+  myfile.open(variance_file_name);
+  //EVFlowNet seems to end ~5 frames earlier
+  int offset = our_flow?5:0;
+  for(int i=0; i<variances.size()-offset; i++)
   {
-	  return -1;
+	  total_var += variances.at(i);
   }
+  myfile << rootdir.string() << "\n";
+  myfile << "variance " << total_var/(1.0*variances.size());
+  myfile.close();
 
 //  auto const pos = path_to_input_rosbag.find_last_of('/');
 //  const std::string output_dir = path_to_input_rosbag.substr(0, pos + 1) + "stats/";
