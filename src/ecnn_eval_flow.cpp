@@ -77,17 +77,14 @@ Flow load_flow_dir(std::string flow_base_path, int image_idx)
 	boost::filesystem::path dir(flow_base_path);
 	boost::filesystem::path file(s);
 	boost::filesystem::path flow_path = dir/file;
-	std::cout << flow_path.string() << std::endl;
 	if(boost::filesystem::exists(flow_path))
 	{
-		std::cout << flow_path << " exists!" << std::endl;
 		cv::FileStorage fs(flow_path.string(), cv::FileStorage::READ);
 		cv::Mat flow_x;
 		cv::Mat flow_y;
 		fs["flow_x"] >> flow_x;
 		fs["flow_y"] >> flow_y;
 		Flow ret = {flow_x, flow_y};
-		std::cout << flow_x.size() << std::endl;
 		return ret;
 	}
 	Flow ret;
@@ -108,7 +105,6 @@ Flow load_flow_hdf(int image_idx)
 		double hdf_ts = 0;
 		sprintf(script, ("SELECT FROM " + s +"/timestamp INTO MEMORY %d").c_str(),
 				HDFql::variableTransientRegister(&hdf_ts));
-		std::cout << script << ": timestamp = " << hdf_ts << std::endl;
 		long long image_size[2] = {0, 0};
 		sprintf(script, ("SHOW DIMENSION " + s + "/flow/flow_x INTO MEMORY %d")
 				.c_str(), HDFql::variableTransientRegister(&image_size));
@@ -121,7 +117,6 @@ Flow load_flow_hdf(int image_idx)
 		sprintf(script, ("SELECT FROM " + s + "/flow/flow_y INTO MEMORY %d").c_str(),
 				HDFql::variableTransientRegister(flow_y.data));
 		int sy = HDFql::execute(script);
-		std::cout << s << ": Flow size = " << image_size[0] << "x" << image_size[1] << std::endl;
 		Flow flow = {flow_x, flow_y};
 		return flow;
 	}
@@ -129,27 +124,95 @@ Flow load_flow_hdf(int image_idx)
 	return ret;
 }
 
-int warp_events_to_image(std::vector<Flow> & flow_arr,
+int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 		std::vector<double> & flow_ts,
 		std::vector<Event>& events,
 		cv::Mat & iwe,
 		int skip_frames,
-		bool reverse_warp = false)
+		int start_event_idx)
 {
 	bool no_warp = false;
-	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
 	int final_flow_idx = skip_frames-1;
 	if(flow_ts.size() < skip_frames )
 	{
 		std::cout << "Insufficient frames:" << flow_ts.size() << "<" << skip_frames << std::endl;
 		return -1;
 	}
-	if(events.back().t < flow_ts.at(final_flow_idx))
+	double end_ts = flow_ts.at(final_flow_idx);
+	int last_event_idx = 0;
+	std::vector<double> timestamps;
 	{
-		std::cout << "Insufficient events:" << flow_ts.size() << "<" << skip_frames
-				<< ", " << events.back().t << "<" << flow_ts.at(final_flow_idx)<< std::endl;
+	for(int flow_idx = 1; flow_idx <= final_flow_idx; flow_idx++)
+		timestamps.push_back(flow_ts.at(flow_idx));
+	}
+	std::cout << "Reverse warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
+	timestamps.push_back(events.front().t);
+	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
+	{
+		last_event_idx = 0;
+		std::cout << "Frame " << timestamps.at(flow_idx) << std::endl;
+		for(int e_idx=start_event_idx; e_idx>=0; e_idx--)
+		{
+			Event & e = events.at(e_idx);
+			double t_ref = timestamps.at(flow_idx);
+			const Flow & flow = flow_arr.at(flow_idx);
+			if(e.t<t_ref) {
+				std::cout << "event " << e_idx << "=" << e.t << "<=" << t_ref << std::endl;
+				break;
+			}
+			if(!no_warp)
+			{
+				double dt = t_ref - e.t;
+				const int ex = int(e.x);
+				const int ey = int(e.y);
+				const cv::Size & flow_sz = flow.at(0).size();
+				if(e.x<0 || e.x>flow_sz.width || e.y<0 || e.y>flow_sz.height) {continue;}
+				double flowx = flow.at(0).at<float>(int(e.y), int(e.x));
+				double flowy = flow.at(1).at<float>(int(e.y), int(e.x));
+				e.x = e.x-flowx*dt;
+				e.y = e.y-flowy*dt;
+				e.t = t_ref;
+			}
+			last_event_idx++;
+		}
+	}
+	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
+	{
+		Event & e = events.at(e_idx);
+		const int px = int(e.x);
+		const int py = int(e.y);
+		const double dx = e.x-px;
+		const double dy = e.y-py;
+		if(px<0 || px>=iwe.size().width-1 || py<0 || py>=iwe.size().height-1) {
+			continue;
+		}
+		iwe.at<float>(cv::Point(px, py)) += e.s * (1.0 - dx) * (1.0 - dy);
+		iwe.at<float>(cv::Point(px + 1, py)) += e.s * dx * (1.0 - dy);
+		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
+		iwe.at<float>(cv::Point(px + 1, py + 1)) += e.s * dx * dy;
+	}
+	return last_event_idx;
+}
+int warp_events_to_image(std::vector<Flow> & flow_arr,
+		std::vector<double> & flow_ts,
+		std::vector<Event>& events,
+		cv::Mat & iwe,
+		int skip_frames)
+{
+	bool no_warp = false;
+	int final_flow_idx = skip_frames-1;
+	if(flow_ts.size() < skip_frames )
+	{
+//		std::cout << "Insufficient frames:" << flow_ts.size() << "<" << skip_frames << std::endl;
 		return -1;
 	}
+	if(events.back().t < flow_ts.at(final_flow_idx))
+	{
+//		std::cout << "Insufficient events:" << flow_ts.size() << "<" << skip_frames
+//				<< ", " << events.back().t << "<" << flow_ts.at(final_flow_idx)<< std::endl;
+		return -1;
+	}
+	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
 	double end_ts = flow_ts.at(final_flow_idx);
 	int last_event_idx = 0;
 	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
@@ -187,7 +250,6 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		if(px<0 || px>=iwe.size().width-1 || py<0 || py>=iwe.size().height-1) {
 			continue;
 		}
-		//std::cout << "add at " << px << ", " << py << std::endl;
 		iwe.at<float>(cv::Point(px, py)) += e.s * (1.0 - dx) * (1.0 - dy);
 		iwe.at<float>(cv::Point(px + 1, py)) += e.s * dx * (1.0 - dy);
 		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
@@ -327,27 +389,30 @@ bool warp_events(const std::string path_to_input_rosbag,
 		cv::Mat iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
 		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
 
-		std::cout << "sum = " << cv::sum(iwe)[0] << std::endl;
-
 		if(last_event_idx > -1)
 		{
+
+			cv::Scalar mean, stdev;
+			cv::meanStdDev(iwe, mean, stdev);
+			iwe -= mean[0];
+			cv::meanStdDev(iwe, mean, stdev);
+			double var = stdev[0]*stdev[0];
+
+			iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
+			warp_events_to_image_reverse(flow_arr, flow_ts, event_arr, iwe,
+					num_frames_skip, last_event_idx);
+			cv::meanStdDev(iwe, mean, stdev);
+			iwe -= mean[0];
+			cv::meanStdDev(iwe, mean, stdev);
+			double var_backward = stdev[0]*stdev[0];
+			std::cout << "var = " << var << ", backvar = " << var_backward << std::endl;
+
 			std::stringstream ss;
 			ss << "/tmp/warps/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
 			std::string s = ss.str();
 			cv::Mat normed;
 			cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
 			cv::imwrite(s, normed);
-
-			cv::Scalar mean, stdev;
-			cv::meanStdDev(iwe, mean, stdev);
-			iwe -= mean[0];
-			cv::meanStdDev(iwe, mean, stdev);
-			double var = stdev*stdev;
-
-			std::reverse(event_arr.begin(), event_arr.begin()+last_event_idx);
-			std::reverse(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
-			std::reverse(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
-			warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip, true);
 
 			variances.push_back(var);
 			event_arr.erase(event_arr.begin(), event_arr.begin()+last_event_idx);
