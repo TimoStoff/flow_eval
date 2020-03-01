@@ -60,6 +60,15 @@ struct Event {
 		x(x), y(y), t(t), s(s) {}
 };
 
+int centercrop(cv::Mat & in, cv::Size & new_size)
+{
+	const int offsetW = (in.cols - new_size.width) / 2;
+	const int offsetH = (in.rows - new_size.height) / 2;
+	const cv::Rect roi(offsetW, offsetH, new_size.width, new_size.height);
+	in = in(roi).clone();
+	return 1;
+}
+
 Flow load_flow_dir(std::string flow_base_path, int image_idx)
 {
 	std::stringstream ss;
@@ -112,7 +121,6 @@ Flow load_flow_hdf(int image_idx)
 				HDFql::variableTransientRegister(flow_y.data));
 		int sy = HDFql::execute(script);
 		std::cout << s << ": Flow size = " << image_size[0] << "x" << image_size[1] << std::endl;
-		std::cout << "Loading flow: " << sx << ", " << sy << std::endl;
 		Flow flow = {flow_x, flow_y};
 		return flow;
 	}
@@ -131,19 +139,19 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 	if(flow_ts.size() < skip_frames )
 	{
 		std::cout << "Insufficient frames:" << flow_ts.size() << "<" << skip_frames << std::endl;
-		return 0;
+		return -1;
 	}
 	if(events.back().t < flow_ts.at(final_flow_idx))
 	{
 		std::cout << "Insufficient events:" << flow_ts.size() << "<" << skip_frames
 				<< ", " << events.back().t << "<" << flow_ts.at(final_flow_idx)<< std::endl;
-		return 0;
+		return -1;
 	}
 	double end_ts = flow_ts.at(final_flow_idx);
 	int last_event_idx = 0;
 	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
 	{
-		std::cout << "Frame " << flow_idx << std::endl;
+		//std::cout << "Frame " << flow_idx << std::endl;
 		for(Event & e: events)
 		{
 			const Flow & flow = flow_arr.at(flow_idx);
@@ -169,7 +177,7 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		const int py = int(e.y);
 		const double dx = e.x-px;
 		const double dy = e.y-py;
-		if(px<0 || px>iwe.size().width || py<0 || py>iwe.size().height) {
+		if(px<0 || px>=iwe.size().width-1 || py<0 || py>=iwe.size().height-1) {
 			continue;
 		}
 //		std::cout << "add at " << px << ", " << py << std::endl;
@@ -178,11 +186,6 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
 		iwe.at<float>(cv::Point(px + 1, py + 1)) += e.s * dx * dy;
 	}
-	events.erase(events.begin(), events.begin()+last_event_idx);
-	std::cout << flow_arr.size() << ", " << skip_frames << std::endl;
-	flow_arr.erase(flow_arr.begin(), flow_arr.begin()+skip_frames);
-	flow_ts.erase(flow_ts.begin(), flow_ts.begin()+skip_frames);
-	std::cout << "sum = " << cv::sum(iwe) << std::endl;
 	return last_event_idx;
 }
 
@@ -226,12 +229,16 @@ bool warp_events(const std::string path_to_input_rosbag,
 
   cv_bridge::CvImagePtr cv_ptr;
   cv::Mat prev_image;
+  double prev_image_ts;
   bool first_msg = true;
   bool first_frame = true;
+  bool has_offset = false;
   double start_time = 0;
   double end_time = 0;
   int image_idx = 0;
   char script[1024];
+  int w_offset = 0;
+  int h_offset = 0;
   std::vector<Flow> flow_arr;
   std::vector<double> flow_ts;
   std::vector<Event> event_arr;
@@ -257,8 +264,8 @@ bool warp_events(const std::string path_to_input_rosbag,
      	end_time = std::max(s->events.back().ts.toSec(), end_time);
 
      	for (auto e : s->events) {
-     		Event event(e.x, e.y, e.ts.toSec(), e.polarity?1:-1);
-     		event_arr.push_back(event);
+     		Event event(e.x-w_offset, e.y-h_offset, e.ts.toSec(), e.polarity?1:-1);
+     		if(event.x>=0 && event.y>=0) {event_arr.push_back(event);}
      	}
     }
 	else if (m.getDataType() == "sensor_msgs/Image" && m.getTopic()==image_topic)
@@ -268,6 +275,7 @@ bool warp_events(const std::string path_to_input_rosbag,
 		double timestamp = icp->header.stamp.toSec();
 		if(first_frame)
 		{
+			prev_image_ts = timestamp;
 			first_frame = false;
 			continue;
 		}
@@ -284,17 +292,29 @@ bool warp_events(const std::string path_to_input_rosbag,
 			Flow flow = load_flow_hdf(image_idx);
 			flow_arr.push_back(flow);
 			flow_ts.push_back(timestamp);
-			std::cout << flow.size() << std::endl;
 		} else
 		{
+			double dt = timestamp-prev_image_ts;
 			Flow flow = load_flow_dir(path_to_input_flow, image_idx);
+			flow.at(0) /= dt;
+			flow.at(1) /= dt;
 			flow_arr.push_back(flow);
 			flow_ts.push_back(timestamp);
-			std::cout << flow.size() << std::endl;
+		}
+		if(!has_offset)
+		{
+			w_offset = (cv_ptr->image.cols-flow_arr.at(0).at(0).cols)/2;
+			h_offset = (cv_ptr->image.rows-flow_arr.at(0).at(0).rows)/2;
+			for(Event & e : event_arr)
+			{
+				e.x -= w_offset;
+				e.y -= h_offset;
+			}
+			has_offset = true;
+			std::cout << "OFFSET = " << w_offset << ", " << h_offset << std::endl;
 		}
 		image_idx ++;
 		cv::Mat iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
-		std::cout << "Mat shape = " << flow_arr.at(0).at(0).size() << ", " << iwe.size() << std::endl;
 		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
 
 		std::stringstream ss;
@@ -303,11 +323,15 @@ bool warp_events(const std::string path_to_input_rosbag,
 		cv::Mat normed;
 		cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
 		cv::imwrite(s, normed);
+		std::cout << "sum = " << cv::sum(iwe)[0] << std::endl;
 
-		if(last_event_idx > 0)
+		if(last_event_idx > -1)
 		{
-
+			event_arr.erase(event_arr.begin(), event_arr.begin()+last_event_idx-1);
+			flow_arr.erase(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
+			flow_ts.erase(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
 		}
+		prev_image_ts = timestamp;
 	}
   }
 
