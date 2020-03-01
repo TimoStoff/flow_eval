@@ -22,6 +22,7 @@
 
 #define foreach BOOST_FOREACH
 
+typedef std::vector<cv::Mat> Flow;
 
 bool parse_arguments(int argc, char* argv[],
                      std::string* path_to_input_rosbag,
@@ -51,15 +52,15 @@ bool parse_arguments(int argc, char* argv[],
 }
 
 struct Event {
-	int x;
-	int y;
+	double x;
+	double y;
 	double t;
-	signed char s;
+	int s;
 	Event(int x, int y, double t, signed char s) :
 		x(x), y(y), t(t), s(s) {}
 };
 
-std::vector<cv::Mat> load_flow_dir(std::string flow_base_path, int image_idx)
+Flow load_flow_dir(std::string flow_base_path, int image_idx)
 {
 	std::stringstream ss;
 	ss << "frame_" << std::setw(10) << std::setfill('0') << image_idx << ".yml";
@@ -76,14 +77,14 @@ std::vector<cv::Mat> load_flow_dir(std::string flow_base_path, int image_idx)
 		cv::Mat flow_y;
 		fs["flow_x"] >> flow_x;
 		fs["flow_y"] >> flow_y;
-		std::vector<cv::Mat> ret = {flow_x, flow_y};
+		Flow ret = {flow_x, flow_y};
 		std::cout << flow_x.size() << std::endl;
 	}
-	std::vector<cv::Mat> ret;
+	Flow ret;
 	return ret;
 }
 
-std::vector<cv::Mat> load_flow_hdf(int image_idx)
+Flow load_flow_hdf(int image_idx)
 {
 
 	char script[1024];
@@ -112,11 +113,77 @@ std::vector<cv::Mat> load_flow_hdf(int image_idx)
 		int sy = HDFql::execute(script);
 		std::cout << s << ": Flow size = " << image_size[0] << "x" << image_size[1] << std::endl;
 		std::cout << "Loading flow: " << sx << ", " << sy << std::endl;
-		std::vector<cv::Mat> flow = {flow_x, flow_y};
+		Flow flow = {flow_x, flow_y};
 		return flow;
 	}
-	std::vector<cv::Mat> ret;
+	Flow ret;
 	return ret;
+}
+
+int warp_events_to_image(std::vector<Flow> & flow_arr,
+		std::vector<double> & flow_ts,
+		std::vector<Event>& events,
+		cv::Mat & iwe,
+		int skip_frames)
+{
+	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
+	int final_flow_idx = skip_frames-1;
+	if(flow_ts.size() < skip_frames )
+	{
+		std::cout << "Insufficient frames:" << flow_ts.size() << "<" << skip_frames << std::endl;
+		return 0;
+	}
+	if(events.back().t < flow_ts.at(final_flow_idx))
+	{
+		std::cout << "Insufficient events:" << flow_ts.size() << "<" << skip_frames
+				<< ", " << events.back().t << "<" << flow_ts.at(final_flow_idx)<< std::endl;
+		return 0;
+	}
+	double end_ts = flow_ts.at(final_flow_idx);
+	int last_event_idx = 0;
+	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
+	{
+		std::cout << "Frame " << flow_idx << std::endl;
+		for(Event & e: events)
+		{
+			const Flow & flow = flow_arr.at(flow_idx);
+			double t_ref = flow_ts.at(flow_idx);
+			if(e.t >= end_ts || e.t >= t_ref) {break;}
+			double dt = t_ref - e.t;
+			const int ex = int(e.x);
+			const int ey = int(e.y);
+			const cv::Size & flow_sz = flow.at(0).size();
+			if(e.x<0 || e.x>flow_sz.width || e.y<0 || e.y>flow_sz.height) {continue;}
+			double flowx = flow.at(0).at<float>(int(e.y), int(e.x));
+			double flowy = flow.at(1).at<float>(int(e.y), int(e.x));
+//			std::cout << e.x << "->" << flowx << "*" << dt << "+" << e.x<<"="<<(flowx*dt+1.0*e.x)<< std::endl;
+			e.x = flowx*dt+e.x;
+			e.y = flowy*dt+e.y;
+			last_event_idx++;
+		}
+	}
+	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
+	{
+		Event & e = events.at(e_idx);
+		const int px = int(e.x);
+		const int py = int(e.y);
+		const double dx = e.x-px;
+		const double dy = e.y-py;
+		if(px<0 || px>iwe.size().width || py<0 || py>iwe.size().height) {
+			continue;
+		}
+//		std::cout << "add at " << px << ", " << py << std::endl;
+		iwe.at<float>(cv::Point(px, py)) += e.s * (1.0 - dx) * (1.0 - dy);
+		iwe.at<float>(cv::Point(px + 1, py)) += e.s * dx * (1.0 - dy);
+		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
+		iwe.at<float>(cv::Point(px + 1, py + 1)) += e.s * dx * dy;
+	}
+	events.erase(events.begin(), events.begin()+last_event_idx);
+	std::cout << flow_arr.size() << ", " << skip_frames << std::endl;
+	flow_arr.erase(flow_arr.begin(), flow_arr.begin()+skip_frames);
+	flow_ts.erase(flow_ts.begin(), flow_ts.begin()+skip_frames);
+	std::cout << "sum = " << cv::sum(iwe) << std::endl;
+	return last_event_idx;
 }
 
 bool warp_events(const std::string path_to_input_rosbag,
@@ -165,7 +232,7 @@ bool warp_events(const std::string path_to_input_rosbag,
   double end_time = 0;
   int image_idx = 0;
   char script[1024];
-  std::vector<std::vector<cv::Mat>> flow_arr;
+  std::vector<Flow> flow_arr;
   std::vector<double> flow_ts;
   std::vector<Event> event_arr;
 
@@ -179,23 +246,20 @@ bool warp_events(const std::string path_to_input_rosbag,
   {
     if (m.getDataType() == "dvs_msgs/EventArray")
     {
+    	std::vector<dvs_msgs::Event>& events = event_packets_for_each_event_topic[m.getTopic()];
+    	dvs_msgs::EventArrayConstPtr s = m.instantiate<dvs_msgs::EventArray>();
+     	int num_events_tmp = s->events.size();
+     	if (first_msg)
+     	{
+     		start_time = s->events.front().ts.toSec();
+     		first_msg = false;
+     	}
+     	end_time = std::max(s->events.back().ts.toSec(), end_time);
 
-      std::vector<dvs_msgs::Event>& events = event_packets_for_each_event_topic[m.getTopic()];
-      dvs_msgs::EventArrayConstPtr s = m.instantiate<dvs_msgs::EventArray>();
-      int num_events_tmp = s->events.size();
-      if (first_msg)
-      {
-        start_time = s->events.front().ts.toSec();
-        first_msg = false;
-      }
-      end_time = std::max(s->events.back().ts.toSec(), end_time);
-
-	  for (auto e : s->events) {
-		  Event event(e.x, e.y, e.ts.toSec(), e.polarity?1:-1);
-		  event_arr.push_back(event);
-		  //Warp events
-	  }
-	   
+     	for (auto e : s->events) {
+     		Event event(e.x, e.y, e.ts.toSec(), e.polarity?1:-1);
+     		event_arr.push_back(event);
+     	}
     }
 	else if (m.getDataType() == "sensor_msgs/Image" && m.getTopic()==image_topic)
 	{
@@ -204,6 +268,7 @@ bool warp_events(const std::string path_to_input_rosbag,
 		double timestamp = icp->header.stamp.toSec();
 		if(first_frame)
 		{
+			first_frame = false;
 			continue;
 		}
 		try
@@ -216,18 +281,33 @@ bool warp_events(const std::string path_to_input_rosbag,
 		}
 		if(flow_h5)
 		{
-			std::vector<cv::Mat> flow = load_flow_hdf(image_idx);
+			Flow flow = load_flow_hdf(image_idx);
 			flow_arr.push_back(flow);
 			flow_ts.push_back(timestamp);
 			std::cout << flow.size() << std::endl;
 		} else
 		{
-			std::vector<cv::Mat> flow = load_flow_dir(path_to_input_flow, image_idx);
+			Flow flow = load_flow_dir(path_to_input_flow, image_idx);
 			flow_arr.push_back(flow);
 			flow_ts.push_back(timestamp);
 			std::cout << flow.size() << std::endl;
 		}
 		image_idx ++;
+		cv::Mat iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
+		std::cout << "Mat shape = " << flow_arr.at(0).at(0).size() << ", " << iwe.size() << std::endl;
+		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
+
+		std::stringstream ss;
+		ss << "/tmp/warps/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
+		std::string s = ss.str();
+		cv::Mat normed;
+		cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+		cv::imwrite(s, normed);
+
+		if(last_event_idx > 0)
+		{
+
+		}
 	}
   }
 
