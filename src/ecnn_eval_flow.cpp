@@ -200,12 +200,12 @@ int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 	return last_event_idx;
 }
 
-int warp_events_to_avg_ts_image(std::vector<Flow> & flow_arr,
+double get_mitrokhin_loss(std::vector<Flow> & flow_arr,
 		std::vector<double> & flow_ts,
 		std::vector<Event>& events,
 		cv::Size & imgsz,
 		int skip_frames,
-		cv::Scalar & loss)
+		const cv::Rect & crop_roi)
 {
 	cv::Mat pos_img(imgsz, CV_32FC1);
 	cv::Mat pos_sum(imgsz, CV_32FC1);
@@ -250,6 +250,7 @@ int warp_events_to_avg_ts_image(std::vector<Flow> & flow_arr,
 			last_event_idx++;
 		}
 	}
+			std::cout << "m1 " << last_event_idx << std::endl;
 	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
 	{
 		Event & e = events.at(e_idx);
@@ -263,14 +264,17 @@ int warp_events_to_avg_ts_image(std::vector<Flow> & flow_arr,
 		double ts = e.t-first_ts;
 		if(e.s>0)
 		{
-			pos_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
-			pos_img.at<float>(cv::Point(px + 1, py)) += ts * dx * (1.0 - dy);
-			pos_img.at<float>(cv::Point(px, py + 1)) += ts * dy * (1.0 - dx);
-			pos_img.at<float>(cv::Point(px + 1, py + 1)) += ts * dx * dy;
-			pos_sum.at<float>(cv::Point(px, py)) +=  (1.0 - dx) * (1.0 - dy);
-			pos_sum.at<float>(cv::Point(px + 1, py)) +=  dx * (1.0 - dy);
-			pos_sum.at<float>(cv::Point(px, py + 1)) +=  dy * (1.0 - dx);
-			pos_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
+			std::cout << ts << std::endl;
+			pos_img.at<float>(py, px) += ts;
+			pos_sum.at<float>(py, px) += 1.0;
+//			pos_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
+//			pos_img.at<float>(cv::Point(px + 1, py)) += ts * dx * (1.0 - dy);
+//			pos_img.at<float>(cv::Point(px, py + 1)) += ts * dy * (1.0 - dx);
+//			pos_img.at<float>(cv::Point(px + 1, py + 1)) += ts * dx * dy;
+//			pos_sum.at<float>(cv::Point(px, py)) +=  (1.0 - dx) * (1.0 - dy);
+//			pos_sum.at<float>(cv::Point(px + 1, py)) +=  dx * (1.0 - dy);
+//			pos_sum.at<float>(cv::Point(px, py + 1)) +=  dy * (1.0 - dx);
+//			pos_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
 		} else
 		{
 			neg_img.at<float>(cv::Point(px, py)) += ts * (1.0 - dx) * (1.0 - dy);
@@ -283,12 +287,22 @@ int warp_events_to_avg_ts_image(std::vector<Flow> & flow_arr,
 			neg_sum.at<float>(cv::Point(px + 1, py + 1)) += dx * dy;
 		}
 	}
+	cv::Mat normed;
+	cv::normalize(pos_img, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+	cv::imshow("pos", normed);
+	cv::waitKey();
 	pos_img = pos_img.mul(1.0/pos_sum);
 	neg_img = neg_img.mul(1.0/neg_sum);
+	cv::normalize(pos_img, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+	cv::imshow("pos", normed);
+	cv::waitKey();
 	cv::Mat pos_prod = pos_img.mul(pos_img);
 	cv::Mat neg_prod = neg_img.mul(neg_img);
-	loss = cv::sum(pos_prod) + cv::sum(neg_prod);
-	return last_event_idx;
+	pos_prod = pos_prod(crop_roi).clone();
+	neg_prod = neg_prod(crop_roi).clone();
+	cv::Scalar loss = cv::sum(pos_prod) + cv::sum(neg_prod);
+	std::cout << "Mitrokhin = " << loss << std::endl;
+	return loss[0];
 }
 int warp_events_to_image(std::vector<Flow> & flow_arr,
 		std::vector<double> & flow_ts,
@@ -355,16 +369,17 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 	return last_event_idx;
 }
 
-std::vector<double> warp_events(const std::string path_to_input_rosbag,
+std::vector<std::vector<double>> warp_events(const std::string path_to_input_rosbag,
 		const std::string path_to_input_flow,
 		const int num_frames_skip,
 		const std::string event_topic,
 		const std::string image_topic,
-		const bool & our_flow
-		)
+		const bool & our_flow,
+		const std::string & outputs_path)
 {
   std::cout << "Processing: " << path_to_input_rosbag << std::endl;
   std::vector<double> variances;
+  std::vector<double> mitrokhin;
 
   auto const pos = path_to_input_rosbag.find_last_of('/');
   const std::string output_dir = path_to_input_rosbag.substr(0, pos + 1) + "stats/";
@@ -385,7 +400,8 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
   catch(rosbag::BagIOException e)
   {
     std::cerr << "Error: could not open rosbag: " << path_to_input_rosbag << std::endl;
-    return variances;
+    std::vector<std::vector<double>> losses = {variances, mitrokhin};
+	return losses;
   }
 
   rosbag::View view(input_bag);
@@ -411,6 +427,7 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
   std::vector<Flow> flow_arr;
   std::vector<double> flow_ts;
   std::vector<Event> event_arr;
+
 
   if(flow_h5)
   {
@@ -454,7 +471,8 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
 					sensor_msgs::image_encodings::TYPE_8UC1);
 		} catch (cv_bridge::Exception& e)
 		{
-			return variances;
+			std::vector<std::vector<double>> losses = {variances, mitrokhin};
+			return losses;
 		}
 		if(flow_h5)
 		{
@@ -475,7 +493,8 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
 		if(flow_arr.back().size() == 0)
 		{
 			input_bag.close();
-			return variances;
+			std::vector<std::vector<double>> losses = {variances, mitrokhin};
+			return losses;
 		}
 		if(!has_offset)
 		{
@@ -490,18 +509,24 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
 			std::cout << "OFFSET = " << w_offset << ", " << h_offset << std::endl;
 		}
 		std::cout << "Image " << image_idx << std::endl;
-		cv::Mat iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
+		cv::Size flow_size = flow_arr.at(0).at(0).size();
+		cv::Size frame_size = cv_ptr->image.size();
+		cv::Mat iwe = cv::Mat::zeros(flow_size, CV_32FC1);
+		const int evfn_crop = 160;
+		const cv::Rect roi = our_flow?cv::Rect((frame_size.width-evfn_crop)/2,
+				(frame_size.height-evfn_crop)/2, 160, 160):
+				cv::Rect(w_offset, h_offset, flow_size.width, flow_size.height);
+		std::cout << "ROI = " << roi << std::endl;
 		int last_event_idx = warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip);
+		std::cout << "Warping used " << last_event_idx << " events" << std::endl;
+		double ml = get_mitrokhin_loss(flow_arr, flow_ts, event_arr, flow_size, num_frames_skip, roi);
+		mitrokhin.push_back(ml);
 
 		if(last_event_idx > -1)
 		{
 			//Need to do this, since EVFlowNet has 160x160 crops
 			//for fair comparison
-			if(our_flow)
-			{
-				const cv::Rect roi(40, 10, 160, 160);
-				iwe = iwe(roi).clone();
-			}
+			iwe = iwe(roi).clone();
 			cv::Scalar mean, stdev;
 			cv::meanStdDev(iwe, mean, stdev);
 			iwe -= mean[0];
@@ -513,11 +538,7 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
 				iwe = cv::Mat::zeros(flow_arr.at(0).at(0).size(), CV_32FC1);
 				warp_events_to_image_reverse(flow_arr, flow_ts, event_arr, iwe,
 						num_frames_skip, last_event_idx);
-				if(our_flow)
-				{
-					const cv::Rect roi(40, 10, 160, 160);
-					iwe = iwe(roi).clone();
-				}
+				iwe = iwe(roi).clone();
 				cv::meanStdDev(iwe, mean, stdev);
 				iwe -= mean[0];
 				cv::meanStdDev(iwe, mean, stdev);
@@ -525,7 +546,7 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
 			}
 
 			std::stringstream ss;
-			ss << "/tmp/warps/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
+			ss << outputs_path << "/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
 			std::string s = ss.str();
 			cv::Mat normed;
 			cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
@@ -543,7 +564,8 @@ std::vector<double> warp_events(const std::string path_to_input_rosbag,
 
   input_bag.close();
 
-  return variances;
+  std::vector<std::vector<double>> losses = {variances, mitrokhin};
+  return losses;
 }
 
 bool write_stats(const std::string path_to_output,
@@ -594,26 +616,32 @@ int main(int argc, char* argv[])
   boost::filesystem::path rootdir = outfile.stem();
   boost::filesystem::path file_path = output_path/rootdir;
 
-  std::vector<double> variances = warp_events(path_to_input_rosbag,
+  std::vector<std::vector<double>> losses = warp_events(path_to_input_rosbag,
 		  path_to_input_flow,
 		  num_frames_skip,
 		  events_topic,
 		  frames_topic,
-		  our_flow);
+		  our_flow,
+		  output_path);
 
+  std::vector<double> & variances = losses.at(0);
+  std::vector<double> & mitrokhins = losses.at(1);
   std::string variance_file_name = file_path.string()+".txt";
   std::cout << "Saving results to " << variance_file_name << std::endl;
   std::ofstream myfile;
   double total_var = 0;
+  double total_mitrokhin = 0;
   myfile.open(variance_file_name);
   //EVFlowNet seems to end ~5 frames earlier
   int offset = our_flow?5:0;
   for(int i=0; i<variances.size()-offset; i++)
   {
 	  total_var += variances.at(i);
+	  total_mitrokhin += mitrokhins.at(i);
   }
   myfile << rootdir.string() << "\n";
-  myfile << "variance " << total_var/(1.0*variances.size());
+  myfile << "variance " << total_var/(1.0*variances.size()) << "\n";
+  myfile << "mitrokhin " << total_mitrokhin/(1.0*variances.size());
   myfile.close();
 
 //  auto const pos = path_to_input_rosbag.find_last_of('/');
