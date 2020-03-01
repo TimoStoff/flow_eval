@@ -88,6 +88,7 @@ Flow load_flow_dir(std::string flow_base_path, int image_idx)
 		fs["flow_y"] >> flow_y;
 		Flow ret = {flow_x, flow_y};
 		std::cout << flow_x.size() << std::endl;
+		return ret;
 	}
 	Flow ret;
 	return ret;
@@ -132,7 +133,8 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 		std::vector<double> & flow_ts,
 		std::vector<Event>& events,
 		cv::Mat & iwe,
-		int skip_frames)
+		int skip_frames,
+		bool reverse_warp = false)
 {
 	bool no_warp = false;
 	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
@@ -175,7 +177,6 @@ int warp_events_to_image(std::vector<Flow> & flow_arr,
 			last_event_idx++;
 		}
 	}
-	//std::cout << "m1" <<  std::endl;
 	for(int e_idx=0; e_idx<last_event_idx; e_idx++)
 	{
 		Event & e = events.at(e_idx);
@@ -248,6 +249,7 @@ bool warp_events(const std::string path_to_input_rosbag,
   std::vector<Flow> flow_arr;
   std::vector<double> flow_ts;
   std::vector<Event> event_arr;
+  std::vector<double> variances;
 
   if(flow_h5)
   {
@@ -302,8 +304,10 @@ bool warp_events(const std::string path_to_input_rosbag,
 		{
 			double dt = timestamp-prev_image_ts;
 			Flow flow = load_flow_dir(path_to_input_flow, image_idx);
-			flow.at(0) /= dt;
-			flow.at(1) /= dt;
+			for(auto & f_c:flow)
+			{
+				f_c /= dt;
+			}
 			flow_arr.push_back(flow);
 			flow_ts.push_back(timestamp);
 		}
@@ -333,7 +337,20 @@ bool warp_events(const std::string path_to_input_rosbag,
 			cv::Mat normed;
 			cv::normalize(iwe, normed, 0, 255, cv::NORM_MINMAX, CV_8UC1);
 			cv::imwrite(s, normed);
-			event_arr.erase(event_arr.begin(), event_arr.begin()+last_event_idx-1);
+
+			cv::Scalar mean, stdev;
+			cv::meanStdDev(iwe, mean, stdev);
+			iwe -= mean[0];
+			cv::meanStdDev(iwe, mean, stdev);
+			double var = stdev*stdev;
+
+			std::reverse(event_arr.begin(), event_arr.begin()+last_event_idx);
+			std::reverse(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
+			std::reverse(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
+			warp_events_to_image(flow_arr, flow_ts, event_arr, iwe, num_frames_skip, true);
+
+			variances.push_back(var);
+			event_arr.erase(event_arr.begin(), event_arr.begin()+last_event_idx);
 			flow_arr.erase(flow_arr.begin(), flow_arr.begin()+num_frames_skip);
 			flow_ts.erase(flow_ts.begin(), flow_ts.begin()+num_frames_skip);
 		}
