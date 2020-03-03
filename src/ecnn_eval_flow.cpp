@@ -75,7 +75,7 @@ int centercrop(cv::Mat & in, cv::Size & new_size)
 	return 1;
 }
 
-Flow load_flow_dir(std::string flow_base_path, int image_idx)
+Flow load_flow_dir(std::string flow_base_path, int image_idx, double & timestamp, bool our_flow=false)
 {
 	std::stringstream ss;
 	ss << "frame_" << std::setw(10) << std::setfill('0') << image_idx << ".yml";
@@ -90,9 +90,25 @@ Flow load_flow_dir(std::string flow_base_path, int image_idx)
 		cv::Mat flow_y;
 		fs["flow_x"] >> flow_x;
 		fs["flow_y"] >> flow_y;
+		if(our_flow)
+		{
+			std::ifstream infile(flow_path.string());
+			std::string line;
+			while (std::getline(infile, line))
+			{
+				if(line.find("timestamp")==0)
+				{
+					std::string ts_str = "timestamp: ";
+					auto ts_pos = line.find(ts_str);
+					line.erase(ts_pos, ts_str.size());
+					timestamp = std::stod(line);
+				}
+			}
+		}
 		Flow ret = {flow_x, flow_y};
 		return ret;
 	}
+	std::cout << flow_path << " NOT FOUND" << std::endl;
 	Flow ret;
 	return ret;
 }
@@ -157,7 +173,6 @@ int warp_events_to_image_reverse(std::vector<Flow> & flow_arr,
 	for(int flow_idx = 0; flow_idx <= final_flow_idx; flow_idx++)
 	{
 		last_event_idx = 0;
-		std::cout << "Frame " << timestamps.at(flow_idx) << std::endl;
 		for(int e_idx=start_event_idx; e_idx>=0; e_idx--)
 		{
 			Event & e = events.at(e_idx);
@@ -214,6 +229,7 @@ double get_mitrokhin_loss(
 		int e_end_idx,
 		cv::Size & imgsz,
 		const cv::Rect & crop_roi,
+		bool crop,
 		bool save_images,
 		const std::string & save_images_path)
 {
@@ -260,8 +276,11 @@ double get_mitrokhin_loss(
 	neg_img = neg_img.mul(1.0/neg_sum);
 	cv::Mat pos_prod = pos_img.mul(pos_img);
 	cv::Mat neg_prod = neg_img.mul(neg_img);
-	pos_prod = pos_prod(crop_roi).clone();
-	neg_prod = neg_prod(crop_roi).clone();
+	if(crop)
+	{
+		pos_prod = pos_prod(crop_roi).clone();
+		neg_prod = neg_prod(crop_roi).clone();
+	}
 	cv::Scalar loss = cv::sum(pos_prod) + cv::sum(neg_prod);
 	if(save_images) {save_image(pos_prod, save_images_path);}
 	return loss[0];
@@ -274,6 +293,7 @@ double get_warp_loss(
 		int e_end_idx,
 		cv::Size & imgsz,
 		const cv::Rect & crop_roi,
+		bool crop,
 		bool save_images,
 		const std::string & save_images_path)
 {
@@ -293,7 +313,7 @@ double get_warp_loss(
 		iwe.at<float>(cv::Point(px, py + 1)) += e.s * dy * (1.0 - dx);
 		iwe.at<float>(cv::Point(px + 1, py + 1)) += e.s * dx * dy;
 	}
-	iwe = iwe(crop_roi).clone();
+	if(crop) {iwe = iwe(crop_roi).clone();}
 	cv::Scalar mean, stdev;
 	cv::meanStdDev(iwe, mean, stdev);
 	iwe -= mean[0];
@@ -312,10 +332,12 @@ int warp_events(std::vector<Flow> & flow_arr,
 	int final_flow_idx = skip_frames-1;
 	if(flow_ts.size() < skip_frames )
 	{
+		std::cout << "Insufficient frames: " << flow_ts.size() <<std::endl;
 		return -1;
 	}
 	if(events.back().t < flow_ts.at(final_flow_idx))
 	{
+		std::cout << "Insufficient time: " << events.back().t << "<" << flow_ts.at(final_flow_idx) <<std::endl;
 		return -1;
 	}
 	std::cout << "Warping events, flow_ts=" << (flow_ts.size()<skip_frames) << std::endl;
@@ -397,6 +419,7 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
   bool reverse_warp = false;
   bool first_msg = true;
   bool first_frame = true;
+  int first_ctr = 0;
   bool has_offset = false;
   double start_time = 0;
   double end_time = 0;
@@ -417,7 +440,7 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
 
   foreach(rosbag::MessageInstance const m, view)
   {
-    if (m.getDataType() == "dvs_msgs/EventArray")
+    if (m.getDataType() == "dvs_msgs/EventArray" && m.getTopic()==event_topic)
     {
     	std::vector<dvs_msgs::Event>& events = event_packets_for_each_event_topic[m.getTopic()];
     	dvs_msgs::EventArrayConstPtr s = m.instantiate<dvs_msgs::EventArray>();
@@ -439,10 +462,12 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
 		sensor_msgs::ImageConstPtr icp =
 				m.instantiate<sensor_msgs::Image>();
 		double timestamp = icp->header.stamp.toSec();
-		if(first_frame)
+		if(first_ctr <= 0)
 		{
 			prev_image_ts = timestamp;
 			first_frame = false;
+			first_ctr ++;
+			std::cout << "Skipped " << first_ctr << std::endl;
 			continue;
 		}
 		try
@@ -454,6 +479,7 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
 			std::vector<std::vector<double>> losses = {variances, mitrokhin};
 			return losses;
 		}
+
 		if(flow_h5)
 		{
 			Flow flow = load_flow_hdf(image_idx);
@@ -462,7 +488,18 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
 		} else
 		{
 			double dt = timestamp-prev_image_ts;
-			Flow flow = load_flow_dir(path_to_input_flow, image_idx);
+			double flow_timestamp = 0;
+			Flow flow = load_flow_dir(path_to_input_flow, image_idx, flow_timestamp, our_flow);
+			if(our_flow)
+			{
+				std::cout << flow_timestamp << "-" << timestamp << "=" << flow_timestamp-timestamp << std::endl;
+				double ts_error = flow_timestamp-timestamp;
+				if(ts_error>0)
+				{
+					//continue;
+				}
+			}
+			std::cout << "Frame " << image_idx << std::endl;
 			for(auto & f_c:flow)
 			{
 				f_c /= dt;
@@ -500,15 +537,21 @@ std::vector<std::vector<double>> warp_events(const std::string path_to_input_ros
 
 
 		int last_event_idx = warp_events(flow_arr, flow_ts, event_arr, num_frames_skip);
+		std::cout << "Last idx = " << last_event_idx << std::endl;
 
-		if(last_event_idx > -1)
+		if(last_event_idx > 0)
 		{
 			std::stringstream ss;
 			ss << outputs_path << "/frame_" << std::setw(9) << std::setfill('0') << image_idx << ".png";
 			std::string s = ss.str();
+			std::stringstream ssf;
+			ssf << outputs_path << "/frame_warp" << std::setw(9) << std::setfill('0') << image_idx << ".png";
+			std::string sf = ssf.str();
 
-			double var = get_warp_loss(event_arr, 0, last_event_idx, flow_size, roi, true, s);
-			double ml = get_mitrokhin_loss(event_arr, 0, last_event_idx, flow_size, roi, false, s);
+			save_image(flow_arr.front().at(0), sf);
+
+			double var = get_warp_loss(event_arr, 0, last_event_idx, flow_size, roi, our_flow, true, s);
+			double ml = get_mitrokhin_loss(event_arr, 0, last_event_idx, flow_size, roi, our_flow, false, s);
 
 			if(reverse_warp)
 			{
